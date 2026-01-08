@@ -102,11 +102,14 @@ import com.getkeepsafe.taptargetview.TapTargetView;
 import com.google.android.material.snackbar.Snackbar;
 
 import java.io.File;
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
@@ -162,6 +165,8 @@ public class PlayerActivity extends Activity {
     private ImageButton buttonRotation;
     private ImageButton exoSettings;
     private ImageButton exoPlayPause;
+    private ImageButton exoSubtitle;
+    private ImageButton buttonAudioTrack;
     private ProgressBar loadingProgressBar;
     private PlayerControlView controlView;
     private CustomDefaultTimeBar timeBar;
@@ -197,6 +202,13 @@ public class PlayerActivity extends Activity {
     static final String API_SUBS_NAME = "subs.name";
     static final String API_TITLE = "title";
     static final String API_END_BY = "end_by";
+
+    // Jellyfin integration constants
+    static final String JELLYFIN_SERVER = "server";
+    static final String JELLYFIN_USER_TOKEN = "user_token";
+    static final String JELLYFIN_USER_ID = "user_id";
+    static final String JELLYFIN_URL = "Jellyfin_URL";
+    static final String JELLYFIN_ITEM_ID = "item_id";
     boolean apiAccess;
     boolean apiAccessPartial;
     String apiTitle;
@@ -204,9 +216,18 @@ public class PlayerActivity extends Activity {
     boolean intentReturnResult;
     boolean playbackFinished;
 
+    // Jellyfin integration fields
+    boolean isJellyfinStream;
+    String jellyfinServer;
+    String jellyfinUserToken;
+    String jellyfinUserId;
+    String jellyfinUrl;
+    String jellyfinItemId;
+    JellyfinApiService jellyfinApiService;
+    Timer jellyfinProgressTimer;
+
     DisplayManager displayManager;
     DisplayManager.DisplayListener displayListener;
-    SubtitleFinder subtitleFinder;
 
     Runnable barsHider = () -> {
         if (playerView != null && !controllerVisible) {
@@ -269,6 +290,7 @@ public class PlayerActivity extends Activity {
                 handleSubtitles(uri);
             } else {
                 Bundle bundle = launchIntent.getExtras();
+                extractJellyfinParameters(bundle);
                 if (bundle != null) {
                     apiAccess = bundle.containsKey(API_POSITION) || bundle.containsKey(API_RETURN_RESULT)
                             || bundle.containsKey(API_SUBS) || bundle.containsKey(API_SUBS_ENABLE);
@@ -589,8 +611,17 @@ public class PlayerActivity extends Activity {
         playerView.setBrightnessControl(mBrightnessControl);
 
         final LinearLayout exoBasicControls = playerView.findViewById(R.id.exo_basic_controls);
-        final ImageButton exoSubtitle = exoBasicControls.findViewById(R.id.exo_subtitle);
+        exoSubtitle = exoBasicControls.findViewById(R.id.exo_subtitle);
         exoBasicControls.removeView(exoSubtitle);
+
+        // Create audio track button
+        buttonAudioTrack = new ImageButton(this, null, 0, R.style.ExoStyledControls_Button_Center);
+        buttonAudioTrack.setContentDescription(getString(R.string.button_audio_track));
+        buttonAudioTrack.setImageResource(R.drawable.ic_volume_up_24dp);
+        buttonAudioTrack.setOnClickListener(view -> {
+            showAudioTrackSelection();
+            resetHideCallbacks();
+        });
 
         exoSettings = exoBasicControls.findViewById(R.id.exo_settings);
         exoBasicControls.removeView(exoSettings);
@@ -613,22 +644,56 @@ public class PlayerActivity extends Activity {
 
         updateButtons(false);
 
+        // Find center controls area
+        final LinearLayout exoCenterControls = playerView.findViewById(R.id.exo_center_controls);
+        final ImageButton exoPlayPause = exoCenterControls.findViewById(R.id.exo_play_pause);
+
+        // Add margins to subtitle button for spacing
+        LinearLayout.LayoutParams subtitleParams = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        subtitleParams.setMargins(0, 0, Utils.dpToPx(16), 0); // 16dp right margin
+        exoSubtitle.setLayoutParams(subtitleParams);
+
+        // Add subtitle button to the left of play/pause
+        exoCenterControls.addView(exoSubtitle, exoCenterControls.indexOfChild(exoPlayPause));
+
+        // Add margins to audio track button for spacing
+        LinearLayout.LayoutParams audioParams = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        audioParams.setMargins(Utils.dpToPx(16), 0, 0, 0); // 16dp left margin
+        buttonAudioTrack.setLayoutParams(audioParams);
+
+        // Add audio track button to the right of play/pause
+        exoCenterControls.addView(buttonAudioTrack, exoCenterControls.indexOfChild(exoPlayPause) + 1);
+
+        // Make progress bar non-focusable to prevent focus stealing
+        // Initially disable focusability of subtitle and audio track buttons
+        // They will be enabled after play/pause button gets focus
+        exoSubtitle.setFocusable(false);
+        exoSubtitle.setFocusableInTouchMode(false);
+        buttonAudioTrack.setFocusable(false);
+        buttonAudioTrack.setFocusableInTouchMode(false);
+        timeBar.setFocusable(false);
+        timeBar.setFocusableInTouchMode(false);
+
+        // Focus will be handled when play/pause button becomes visible in updateLoading()
+
         final HorizontalScrollView horizontalScrollView = (HorizontalScrollView) getLayoutInflater().inflate(R.layout.controls, null);
         final LinearLayout controls = horizontalScrollView.findViewById(R.id.controls);
 
-        controls.addView(buttonOpen);
-        controls.addView(exoSubtitle);
-        controls.addView(buttonAspectRatio);
-        if (Utils.isPiPSupported(this) && buttonPiP != null) {
-            controls.addView(buttonPiP);
-        }
+        // controls.addView(buttonOpen); // Folder icon button - hidden
+        // controls.addView(exoSubtitle); // Moved to center controls
+        // controls.addView(buttonAspectRatio); // Aspect ratio button - hidden
+        // if (Utils.isPiPSupported(this) && buttonPiP != null) {
+        //     controls.addView(buttonPiP); // PiP button - hidden
+        // }
         if (mPrefs.repeatToggle) {
             controls.addView(exoRepeat);
         }
         if (!isTvBox) {
             controls.addView(buttonRotation);
         }
-        controls.addView(exoSettings);
+        // controls.addView(exoSettings); // Settings button - hidden
 
         exoBasicControls.addView(horizontalScrollView);
 
@@ -749,6 +814,27 @@ public class PlayerActivity extends Activity {
 
     @Override
     public void onStop() {
+        // Jellyfin playback stop reporting when activity stops (user pressed back)
+        if (isJellyfinStream && jellyfinApiService != null && player != null) {
+            long positionTicks = player.getCurrentPosition() * 10000;
+            // Stop progress timer
+            if (jellyfinProgressTimer != null) {
+                jellyfinProgressTimer.cancel();
+                jellyfinProgressTimer = null;
+            }
+            // Report playback stopped due to user action (back button)
+            jellyfinApiService.reportPlaybackStop(jellyfinItemId, positionTicks, new okhttp3.Callback() {
+                @Override
+                public void onFailure(okhttp3.Call call, IOException e) {
+                    // Silent failure
+                }
+                @Override
+                public void onResponse(okhttp3.Call call, okhttp3.Response response) throws IOException {
+                    response.close();
+                }
+            });
+        }
+
         super.onStop();
         alive = false;
         if (Build.VERSION.SDK_INT >= 31) {
@@ -794,6 +880,8 @@ public class PlayerActivity extends Activity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+
+        extractJellyfinParameters(intent.getExtras());
 
         if (intent != null) {
             final String action = intent.getAction();
@@ -1069,6 +1157,86 @@ public class PlayerActivity extends Activity {
         apiTitle = null;
         apiSubs.clear();
         mPrefs.setPersistent(true);
+
+        // Reset Jellyfin fields
+        isJellyfinStream = false;
+        jellyfinServer = null;
+        jellyfinUserToken = null;
+        jellyfinUserId = null;
+        jellyfinUrl = null;
+        jellyfinItemId = null;
+        jellyfinApiService = null;
+        if (jellyfinProgressTimer != null) {
+            jellyfinProgressTimer.cancel();
+            jellyfinProgressTimer = null;
+        }
+    }
+
+    private void extractJellyfinParameters(Bundle bundle) {
+        if (bundle != null) {
+            isJellyfinStream = "jellyfin".equals(bundle.getString(JELLYFIN_SERVER));
+            if (isJellyfinStream) {
+                jellyfinServer = bundle.getString(JELLYFIN_SERVER);
+                jellyfinUserToken = bundle.getString(JELLYFIN_USER_TOKEN);
+                jellyfinUserId = bundle.getString(JELLYFIN_USER_ID);
+                jellyfinUrl = bundle.getString(JELLYFIN_URL);
+                jellyfinItemId = bundle.getString(JELLYFIN_ITEM_ID);
+
+                if (jellyfinUrl != null && jellyfinUserToken != null && jellyfinUserId != null) {
+                    jellyfinApiService = new JellyfinApiService(jellyfinUrl, jellyfinUserToken, jellyfinUserId);
+                }
+            }
+        }
+    }
+
+    private void showAudioTrackSelection() {
+        if (player == null) return;
+
+        Tracks tracks = player.getCurrentTracks();
+
+        List<String> audioTrackNames = new ArrayList<>();
+        List<String> audioTrackIds = new ArrayList<>();
+
+        // Add "Default" option
+        audioTrackNames.add(getString(R.string.pref_language_audio));
+        audioTrackIds.add(null);
+
+        // Add available audio tracks
+        for (Tracks.Group group : tracks.getGroups()) {
+            if (group.getType() == C.TRACK_TYPE_AUDIO) {
+                for (int j = 0; j < group.getMediaTrackGroup().length; j++) {
+                    Format format = group.getMediaTrackGroup().getFormat(j);
+                    String trackName = format.label != null ? format.label :
+                        (format.language != null ? format.language :
+                        "Audio Track " + (j + 1));
+                    audioTrackNames.add(trackName);
+                    audioTrackIds.add(format.id);
+                }
+            }
+        }
+
+        if (audioTrackNames.size() <= 1) {
+            // Only default option available
+            Utils.showText(playerView, "No alternative audio tracks available", 2000);
+            return;
+        }
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Select Audio Track");
+
+        String[] trackNamesArray = audioTrackNames.toArray(new String[0]);
+        builder.setItems(trackNamesArray, (dialog, which) -> {
+            String selectedAudioId = audioTrackIds.get(which);
+            setSelectedTracks(mPrefs.subtitleTrackId, selectedAudioId);
+            if (selectedAudioId != null) {
+                Utils.showText(playerView, "Selected: " + trackNamesArray[which], 2000);
+            } else {
+                Utils.showText(playerView, "Using default audio track", 2000);
+            }
+        });
+
+        builder.setNegativeButton(android.R.string.cancel, null);
+        builder.show();
     }
 
     @Override
@@ -1421,6 +1589,13 @@ public class PlayerActivity extends Activity {
             player.release();
             player = null;
         }
+
+        // Clean up Jellyfin progress timer
+        if (jellyfinProgressTimer != null) {
+            jellyfinProgressTimer.cancel();
+            jellyfinProgressTimer = null;
+        }
+
         titleView.setVisibility(View.GONE);
         updateButtons(false);
     }
@@ -1442,6 +1617,82 @@ public class PlayerActivity extends Activity {
         @Override
         public void onIsPlayingChanged(boolean isPlaying) {
             playerView.setKeepScreenOn(isPlaying);
+
+            // Jellyfin playback reporting
+            if (isJellyfinStream && jellyfinApiService != null) {
+                long positionTicks = player.getCurrentPosition() * 10000; // Convert to ticks (100ns units)
+
+                if (isPlaying) {
+                    // Start progress timer when playing
+                    if (jellyfinProgressTimer != null) {
+                        jellyfinProgressTimer.cancel();
+                    }
+                    jellyfinProgressTimer = new Timer();
+                    jellyfinProgressTimer.scheduleAtFixedRate(new TimerTask() {
+                        @Override
+                        public void run() {
+                            runOnUiThread(() -> {
+                                if (player != null && player.isPlaying()) {
+                                    long currentPositionTicks = player.getCurrentPosition() * 10000;
+                                    jellyfinApiService.reportPlaybackProgress(jellyfinItemId, currentPositionTicks, false, new okhttp3.Callback() {
+                                        @Override
+                                        public void onFailure(okhttp3.Call call, IOException e) {
+                                            // Silent failure for progress updates
+                                        }
+                                        @Override
+                                        public void onResponse(okhttp3.Call call, okhttp3.Response response) throws IOException {
+                                            response.close();
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    }, 10000, 10000); // Start after 10 seconds, repeat every 10 seconds
+
+                    // Report playback started if position is near beginning, otherwise report resume
+                    if (player.getCurrentPosition() < 5000) { // Within first 5 seconds
+                        jellyfinApiService.reportPlaybackStart(jellyfinItemId, positionTicks, new okhttp3.Callback() {
+                            @Override
+                            public void onFailure(okhttp3.Call call, IOException e) {
+                                // Silent failure
+                            }
+                            @Override
+                            public void onResponse(okhttp3.Call call, okhttp3.Response response) throws IOException {
+                                response.close();
+                            }
+                        });
+                    } else {
+                        // Report resume from pause
+                        jellyfinApiService.reportPlaybackProgress(jellyfinItemId, positionTicks, false, new okhttp3.Callback() {
+                            @Override
+                            public void onFailure(okhttp3.Call call, IOException e) {
+                                // Silent failure
+                            }
+                            @Override
+                            public void onResponse(okhttp3.Call call, okhttp3.Response response) throws IOException {
+                                response.close();
+                            }
+                        });
+                    }
+                } else {
+                    // Stop progress timer when not playing
+                    if (jellyfinProgressTimer != null) {
+                        jellyfinProgressTimer.cancel();
+                        jellyfinProgressTimer = null;
+                    }
+                    // Report paused
+                    jellyfinApiService.reportPlaybackProgress(jellyfinItemId, positionTicks, true, new okhttp3.Callback() {
+                        @Override
+                        public void onFailure(okhttp3.Call call, IOException e) {
+                            // Silent failure
+                        }
+                        @Override
+                        public void onResponse(okhttp3.Call call, okhttp3.Response response) throws IOException {
+                            response.close();
+                        }
+                    });
+                }
+            }
 
             if (Utils.isPiPSupported(PlayerActivity.this)) {
                 if (isPlaying) {
@@ -1574,6 +1825,39 @@ public class PlayerActivity extends Activity {
                 }
             } else if (state == Player.STATE_ENDED) {
                 playbackFinished = true;
+
+                // Jellyfin playback end reporting
+                if (isJellyfinStream && jellyfinApiService != null) {
+                    long positionTicks = player.getCurrentPosition() * 10000;
+                    // Stop progress timer
+                    if (jellyfinProgressTimer != null) {
+                        jellyfinProgressTimer.cancel();
+                        jellyfinProgressTimer = null;
+                    }
+                    // Report playback stopped
+                    jellyfinApiService.reportPlaybackStop(jellyfinItemId, positionTicks, new okhttp3.Callback() {
+                        @Override
+                        public void onFailure(okhttp3.Call call, IOException e) {
+                            // Silent failure
+                        }
+                        @Override
+                        public void onResponse(okhttp3.Call call, okhttp3.Response response) throws IOException {
+                            response.close();
+                        }
+                    });
+                    // Mark item as played
+                    jellyfinApiService.markItemPlayed(jellyfinItemId, new okhttp3.Callback() {
+                        @Override
+                        public void onFailure(okhttp3.Call call, IOException e) {
+                            // Silent failure
+                        }
+                        @Override
+                        public void onResponse(okhttp3.Call call, okhttp3.Response response) throws IOException {
+                            response.close();
+                        }
+                    });
+                }
+
                 if (apiAccess) {
                     finish();
                 }
@@ -1975,15 +2259,6 @@ public class PlayerActivity extends Activity {
         if (mPrefs.mediaUri == null)
             return;
 
-        if (Utils.isSupportedNetworkUri(mPrefs.mediaUri) && Utils.isProgressiveContainerUri(mPrefs.mediaUri)) {
-            SubtitleUtils.clearCache(this);
-            if (SubtitleFinder.isUriCompatible(mPrefs.mediaUri)) {
-                subtitleFinder = new SubtitleFinder(PlayerActivity.this, mPrefs.mediaUri);
-                subtitleFinder.start();
-            }
-            return;
-        }
-
         if (mPrefs.scopeUri != null || isTvBox) {
             DocumentFile video = null;
             File videoRaw = null;
@@ -2097,9 +2372,16 @@ public class PlayerActivity extends Activity {
         } else {
             loadingProgressBar.setVisibility(View.GONE);
             exoPlayPause.setVisibility(View.VISIBLE);
-            if (focusPlay) {
+            if (focusPlay || exoPlayPause.getVisibility() == View.VISIBLE) {
                 focusPlay = false;
                 exoPlayPause.requestFocus();
+                // Enable other controls after play/pause has focus
+                exoSubtitle.setFocusable(true);
+                exoSubtitle.setFocusableInTouchMode(true);
+                buttonAudioTrack.setFocusable(true);
+                buttonAudioTrack.setFocusableInTouchMode(true);
+                timeBar.setFocusable(true);
+                timeBar.setFocusableInTouchMode(true);
             }
         }
     }
